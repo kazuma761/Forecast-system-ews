@@ -7,27 +7,249 @@ when the worst-case cash track falls short of a scheduled EMI, estimates
 **Expected Loss = EAD × PD × LGD**, and streams ranked alerts to relationship
 managers through a FastAPI service.
 
+See [How it works](#how-it-works) for the architecture and the request flows.
+
+## How it works
+
+The system has two paths that never block each other:
+
+* **The write path** (ingest, refresh, nightly scoring) turns raw ledgers into features, runs the
+  forecaster over the whole book and stores the results.
+* **The read path** (`/predict/ews`, `/alerts/active`) answers requests from those stored results.
+  It runs the model only for what isn't stored: specific accounts, older dates, other triggers, or
+  forecast paths.
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph SRC["Sources"]
+        S1["Core banking ledgers<br/>EOD balances, transactions"]
+        S2["Bureau pulls<br/>CIBIL"]
+        S3["Loan master<br/>EMI schedules"]
+    end
+
+    subgraph WRITE["Write path (background / nightly)"]
+        ING["POST /api/v1/ingest<br/>JSON, file upload, server dataset<br/>Pydantic validation, Arrow batches"]
+        AGG["Incremental aggregation<br/>SQL window functions<br/>data_engine/aggregation.py"]
+        VC["Vector cache build<br/>memory-mapped tensors<br/>data_engine/vector_cache.py"]
+        BOOK["Whole-book scoring<br/>score_book: one forward pass<br/>30 / 60 / 90 days"]
+    end
+
+    subgraph DB["DuckDB or PostgreSQL"]
+        RAW[("accounts, daily_balances,<br/>transactions, credit_profiles,<br/>loan_schedules, holidays")]
+        FM[("feature_matrix")]
+        RES[("forecast_runs<br/>account_scores<br/>ews_alerts")]
+    end
+
+    subgraph MODEL["Forecasting and risk"]
+        ENG["Forecast engine<br/>STFormer (production)<br/>TimesFM 3.0 (research only)"]
+        RISK["Risk engine<br/>SMA-0/1/2, PD, EAD, LGD, EL<br/>models/risk.py"]
+        BEH["Behaviour engine<br/>deposit attrition, cost of funds<br/>models/behavior.py"]
+    end
+
+    subgraph READ["Read path (FastAPI)"]
+        PRED["POST /api/v1/predict/ews"]
+        ALR["GET /api/v1/alerts/active<br/>JSON or SSE stream"]
+    end
+
+    RM(["Relationship managers<br/>dashboards, downstream systems"])
+
+    S1 & S2 & S3 --> ING --> RAW
+    RAW --> AGG --> FM --> VC
+    VC --> BOOK --> ENG
+    ENG --> RISK & BEH
+    RISK & BEH --> RES
+    RES --> PRED & ALR
+    VC -. "accounts not stored,<br/>paths, older dates" .-> PRED
+    PRED --> RM
+    ALR --> RM
 ```
-                     [ INPUT DATA SOURCE ]
-        daily ledgers · EOD balances · bureau pulls · EMI schedules
-                               │  /api/v1/ingest (JSON · streamed files · datasets)
-                               ▼
-                  [ HIGH-PERFORMANCE DATA LAYER ]
-   DuckDB / PostgreSQL ─ incremental window-function aggregation (data_engine/aggregation.py)
-   └─ memory-mapped tensor cache [accounts × days × channels] (data_engine/vector_cache.py)
-                               ▼
-              [ MULTIVARIATE FORECASTING ENGINE ]
-   stformer : spatial-temporal patch transformer (models/stformer.py)  ← trained in-repo
-   timesfm3 : pretrained google/timesfm-3.0-pytorch with covariates    ← optional, zero-shot
-                               │
-         ┌─────────────────────┴──────────────────────┐
-         ▼                                            ▼
- [ PREDICTIVE RISK ENGINE ]                 [ CUSTOMER BEHAVIOUR ENGINE ]
-  SMA-0/1/2 · PD · EAD · LGD · EL            balance trajectories · deposit-attrition
-  (models/risk.py)                           & cost-of-funds alerts (models/behavior.py)
-                               ▼
-                     [ CENTRAL API GATEWAY ]
-   FastAPI (api/) · /api/v1/predict/ews · /api/v1/alerts/active (JSON + SSE)
+
+### From a daily file to a stored book run
+
+An ingest returns as soon as the rows are written. The refresh and the rescore run afterwards in the
+background, so callers never wait for the model.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as FastAPI
+    participant IE as IngestionEngine
+    participant DB as Database
+    participant P as EWSPipeline
+    participant VC as Vector cache
+    participant E as Forecast engine
+
+    C->>API: POST /api/v1/ingest (balances, transactions, bureau, schedules)
+    API->>IE: validated records as Arrow batches
+    IE->>DB: upsert in batches
+    IE->>DB: mark feature_matrix dirty from the earliest event date
+    API-->>C: 200 rows per table, refresh "scheduled"
+    Note over API,P: background task after the response
+    API->>P: refresh_and_rescore()
+    P->>DB: recompute feature_matrix from min(watermark + 1, dirty_from)
+    P->>VC: rebuild memory-mapped tensors (new cache_version)
+    P->>P: score_book(): skip if a stored run already matches data and model
+    loop each shard of 50,000 accounts
+        P->>VC: slice 512-day context and known future covariates
+        P->>E: forecast 90 days, 9 quantiles
+        E-->>P: balance and utilisation tracks
+        P->>P: risk and behaviour for 30, 60 and 90 days
+        P->>DB: stage account_scores, and PENDING alerts for the 90-day run
+    end
+    P->>DB: publish 30 and 60-day runs (scores only)
+    P->>DB: publish 90-day run: supersede old alerts, activate new ones
+    P->>DB: keep the newest 3 book runs per horizon
+```
+
+### A `/predict/ews` request
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as FastAPI /predict/ews
+    participant P as EWSPipeline
+    participant DB as Database
+    participant VC as Vector cache
+    participant E as Forecast engine
+
+    C->>API: horizon, triggers, account_ids?, include_paths?
+    API->>P: score(request), never refreshes data
+    alt whole book, latest day, paths none or "flagged"
+        P->>DB: latest BOOK run matching cache_version, model_version, horizon, triggers
+        alt a stored run matches
+            DB-->>P: account_scores rows
+            opt include_paths = "flagged"
+                P->>VC: slice flagged accounts only
+                P->>E: forecast flagged accounts
+            end
+            P-->>API: source "stored" (about 50 ms on 4,500 accounts)
+        else nothing stored yet
+            P->>P: fall through to live scoring
+        end
+    end
+    opt live scoring (account lists, older dates, other triggers, all paths)
+        P->>VC: slice requested accounts
+        P->>E: forecast
+        P->>P: risk and behaviour, score table, paths
+        P->>DB: record run and alerts (if persist_alerts)
+        P-->>API: source "live"
+    end
+    API-->>C: JSON serialised with orjson
+```
+
+### Alerts to relationship managers
+
+Alerts from a run stay invisible until the whole run is published, so a reader never sees half a run.
+A run that crashes before publishing leaves only staged rows, and these are cleaned up at the next
+startup.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Scoring run
+    participant DB as ews_alerts
+    participant B as AlertBroker
+    participant RM as RM dashboard
+
+    RM->>B: GET /alerts/active?stream=true&follow=true
+    B-->>RM: snapshot of ranked ACTIVE alerts
+    P->>DB: insert alerts as PENDING (one shard at a time)
+    P->>DB: one transaction: older alerts of these accounts become SUPERSEDED, PENDING becomes ACTIVE
+    P->>B: publish new alerts (live runs)
+    B-->>RM: SSE "alert" events
+    RM->>DB: POST /alerts/{id}/ack, alert becomes ACKNOWLEDGED
+```
+
+Ranking: credit alerts come before deposit-attrition alerts. Within credit alerts the order is by
+`priority = expected loss × 0.5^(days / 30)`, where days is the earlier of days-to-zero and
+days-to-breach; then by exposure, then by days to zero.
+
+### Inside the forecaster (STFormer)
+
+```mermaid
+flowchart TB
+    IN1["past 512 days x 6<br/>balance, utilisation, CIBIL,<br/>outward volatility, missed salary, payment return"]
+    IN2["known 512 + 96 days x 3<br/>EMI due, bank holiday, payroll day"]
+    NORM["Reversible normalisation per account<br/>money scaled by the balance's own spread"]
+    PATCH["32-day patches, residual MLP embedding<br/>+ variate, position, static and query embeddings"]
+    GRID["Token grid: 9 variates x 19 patches<br/>16 past + 3 future"]
+    subgraph BLOCK["Repeated N times"]
+        TA["Temporal attention<br/>each variate across time"]
+        SA["Spatial attention<br/>variates against each other, per patch"]
+        FF["Feed-forward"]
+        TA --> SA --> FF
+    end
+    HEAD["Head on future balance and utilisation tokens"]
+    Q["9 non-crossing quantiles q10 to q90<br/>de-normalised to account units"]
+
+    IN1 & IN2 --> NORM --> PATCH --> GRID --> BLOCK --> HEAD --> Q
+```
+
+### From forecast to SMA tier and expected loss
+
+```mermaid
+flowchart TB
+    Q["Balance quantiles for the next 90 days"] --> AV["Available balance going into each EMI date<br/>= previous day's EOD on the trigger track (q10)"]
+    EMI["EMI schedule"] --> CMP{"available < EMI?"}
+    AV --> CMP
+    CMP -- "no shortfall in horizon" --> G["GREEN"]
+    CMP -- "first shortfall day" --> D{"days out"}
+    D -- "1 to 30" --> S0["SMA-0"]
+    D -- "31 to 60" --> S1["SMA-1"]
+    D -- "61 to 90" --> S2["SMA-2"]
+    Q --> PDC["P(balance < EMI) from all 9 quantiles"]
+    UQ["Utilisation quantiles"] --> PU["P(utilisation > 95%)"]
+    CIB["CIBIL score"] --> PB["Bureau PD"]
+    PDC & PU & PB --> PD["PD = 1 - (1 - pd_cash)(1 - w_u p_util)(1 - w_b pd_bureau)"]
+    UQ --> EAD["EAD = outstanding loan + max(drawn now, q90 drawn at breach)"]
+    S0 & S1 & S2 --> EL["Expected loss = EAD x PD x LGD"]
+    PD --> EL
+    EAD --> EL
+    EL --> PR["Priority = EL x urgency, then rank alerts"]
+```
+
+### Main tables
+
+```mermaid
+erDiagram
+    accounts ||--o{ daily_balances : has
+    accounts ||--o{ transactions : has
+    accounts ||--o{ credit_profiles : "bureau pulls"
+    accounts ||--o{ loan_schedules : "EMI dates"
+    accounts ||--o{ feature_matrix : "daily features"
+    forecast_runs ||--o{ account_scores : "one row per account"
+    forecast_runs ||--o{ ews_alerts : raises
+    accounts ||--o{ account_scores : scored
+    accounts ||--o{ ews_alerts : flagged
+
+    forecast_runs {
+        string run_id PK
+        string scope "BOOK or ACCOUNTS"
+        string cache_version "data version scored"
+        string model_version "hash of the weights"
+        int horizon
+        float liability_quantile
+        float asset_quantile
+    }
+    account_scores {
+        string run_id PK
+        string account_id PK
+        string risk_tier
+        float probability_of_default
+        float exposure_at_default
+        float expected_loss
+    }
+    ews_alerts {
+        string alert_id PK
+        string run_id
+        string alert_type "CREDIT_EWS or DEPOSIT_ATTRITION"
+        string status "PENDING ACTIVE ACKNOWLEDGED SUPERSEDED"
+        float priority_score
+    }
 ```
 
 ## Quick start
